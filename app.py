@@ -20,7 +20,7 @@ def has_dbcs(text):
     return any(unicodedata.east_asian_width(ch) in ('F', 'W', 'A') for ch in text)
 
 def detect_offset(line):
-    """偵測 AS400 原始碼是否有 12-byte 序號前綴"""
+    """偵測 AS400 DSPF 原始碼是否有 12-byte 序號前綴"""
     if len(line) > 17 and line[17].upper() == 'A' and (len(line) <= 18 or line[18] in (' ', '*', 'R', 'O', 'N')):
         return 12
     elif len(line) > 5 and line[5].upper() == 'A':
@@ -28,31 +28,43 @@ def detect_offset(line):
     return None
 
 def parse_ref_files(ref_contents):
-    """解析上傳的外部參照檔 (如 LAYOUT PF)，建立 {欄位名稱: (長度, 型態, 小數位)} 字典"""
+    """
+    解析上傳的外部參照檔 (如 LAYOUT.txt)。
+    支援省略第 6 格 'A' 的格式，並自動處理單行或被壓縮成同一行的欄位定義。
+    """
     ref_dict = {}
+    # 匹配模式：(可選前綴) + 欄位名稱 + 長度(1~5位數) + 型態(A/S/O/P/B/J/E或空白) + 小數位(可選) + 後續關鍵字(COLHDG/TEXT/EDTCDE等或行尾)
+    pattern = re.compile(
+        r'(?:^|\s)(?!R\s|K\s)([A-Z0-9_#@$]{2,10})\s+(\d{1,5})([ASOPBJE\s])(?:\s*(\d{1,2}))?(?=\s+(?:COLHDG\vert{}TEXT\vert{}EDTCDE\vert{}EDTWRD\vert{}VALUES\vert{}CHECK\vert{}COMP\vert{}RANGE\vert{}ALIAS\vert{}DFT)\vert{}\s*$)',
+        re.IGNORECASE | re.MULTILINE
+    )
+    
     for content in ref_contents:
+        # 1. 先逐行處理標準固定欄位或省略 'A' 的行
         for line in content.splitlines():
             if not line.strip():
                 continue
-            offset = detect_offset(line)
-            if offset is None or (len(line) > offset + 6 and line[offset + 6] == '*'):
+            # 排除註解行 (含 ** 或 A* 或 /*)
+            stripped = line.strip()
+            if stripped.startswith('*') or stripped.startswith('/*') or 'A*' in line[:25] or '**' in line[:25]:
                 continue
-            if len(line) < offset + 35:
-                continue
-            name_type = line[offset + 16 : offset + 17].upper()
-            if name_type == 'R':
-                continue
-            field_name = line[offset + 18 : offset + 28].strip().upper()
-            length_str = line[offset + 29 : offset + 34].strip()
-            data_type = line[offset + 34 : offset + 35].strip().upper()
-            dec_pos = line[offset + 35 : offset + 37].strip() if len(line) >= offset + 37 else ''
-            
-            if field_name and length_str.isdigit():
-                ref_dict[field_name] = {
-                    'length': int(length_str),
-                    'data_type': data_type,
-                    'dec_pos': dec_pos
-                }
+                
+            for match in pattern.finditer(line):
+                field_name = match.group(1).strip().upper()
+                length_str = match.group(2).strip()
+                data_type = match.group(3).strip().upper()
+                dec_pos = (match.group(4) or '').strip()
+                
+                # 若型態為空白，若有小數位則為 S (Signed Numeric)，否則為 A (Character)
+                if not data_type:
+                    data_type = 'S' if dec_pos != '' else 'A'
+                    
+                if field_name and length_str.isdigit():
+                    ref_dict[field_name] = {
+                        'length': int(length_str),
+                        'data_type': data_type,
+                        'dec_pos': dec_pos
+                    }
     return ref_dict
 
 def parse_dds_by_record(file_content, ref_dict, default_ref_len=6):
@@ -90,12 +102,12 @@ def parse_dds_by_record(file_content, ref_dict, default_ref_len=6):
         ref_ind = line[offset + 28 : offset + 29].strip().upper()
         length_str = line[offset + 29 : offset + 34].strip()
         data_type = line[offset + 34 : offset + 35].strip().upper()
+        dec_pos = line[offset + 35 : offset + 37].strip()
         usage = line[offset + 37 : offset + 38].strip().upper()
         row_str = line[offset + 38 : offset + 41].strip()
         col_str = line[offset + 41 : offset + 44].strip()
         text_part = line[offset + 44:].strip()
 
-        # 記錄座標規則 (保留 +n 資訊，以便使用者在表格修改長度時能動態重算位置)
         pos_mode = None
         raw_row = None
         raw_col = None
@@ -153,9 +165,10 @@ def parse_dds_by_record(file_content, ref_dict, default_ref_len=6):
                 length = ref_dict[target_ref_name]['length']
                 if not data_type:
                     data_type = ref_dict[target_ref_name]['data_type']
-                ref_source = f"參照檔 ({target_ref_name})"
+                if not dec_pos:
+                    dec_pos = ref_dict[target_ref_name]['dec_pos']
+                ref_source = f"LAYOUT ({target_ref_name})"
             else:
-                # 若未上傳參照檔，嘗試從 EDTWRD 或 VALUES 智慧推算
                 edtwrd_match = re.search(r"EDTWRD\('([^']+)'\)", text_part)
                 if edtwrd_match:
                     length = len(edtwrd_match.group(1).replace('/', '').replace(':', '').replace('-', ''))
@@ -174,26 +187,27 @@ def parse_dds_by_record(file_content, ref_dict, default_ref_len=6):
             edtwrd_match = re.search(r"EDTWRD\('([^']+)'\)", text_part)
             disp_len = len(edtwrd_match.group(1)) if edtwrd_match else length
 
+            type_display = f"{data_type} ({dec_pos})" if dec_pos else (data_type or 'A')
+
             records[current_record].append({
                 'type': 'field', 'pos_mode': pos_mode, 'raw_row': raw_row, 'raw_col': raw_col,
                 'text': '', 'length': length, 'disp_len': disp_len,
                 'usage': usage, 'name': field_name, 'ref': is_ref,
                 'ref_target': target_ref_name if is_ref else '',
                 'ref_source': ref_source,
-                'data_type': data_type, 'keywords': text_part
+                'data_type': type_display, 'keywords': text_part
             })
 
     return records
 
 def calculate_positions(elements, custom_lengths):
-    """根據欄位長度（包含使用者在表格手動修改後的長度），動態計算所有 +n 元素的實際座標"""
+    """根據欄位長度動態計算所有 +n 元素的實際座標"""
     last_row = 1
     last_end_col = 1
     resolved = []
 
     for idx, el in enumerate(elements):
         item = el.copy()
-        # 若使用者在下方表格手動修改了該欄位的顯示長度，優先套用
         if item['type'] == 'field' and idx in custom_lengths:
             new_len = custom_lengths[idx]
             item['length'] = new_len
@@ -270,8 +284,8 @@ def decode_bytes(raw_bytes, selected_enc):
             return raw_bytes.decode("utf-8", errors="replace")
 
 # --- 網頁介面開始 ---
-st.set_page_config(page_title="AS400 綠幕模擬器 (支援 REFFLD)", layout="wide")
-st.title("📟 AS400 DSPF 綠幕預覽器 (支援 REFFLD 參照檔 & 動態調整)")
+st.set_page_config(page_title="AS400 綠幕模擬器 (支援 LAYOUT)", layout="wide")
+st.title("📟 AS400 DSPF 綠幕預覽器 (支援 LAYOUT 參照檔 & 動態調整)")
 
 col1, col2 = st.columns([2, 1])
 with col1:
@@ -295,16 +309,17 @@ with u_col1:
     uploaded_file = st.file_uploader("2. 上傳 DSPF 畫面檔 (必填)", type=["txt", "dds", "dspf"])
 with u_col2:
     uploaded_refs = st.file_uploader(
-        "3. 上傳參照檔如 LAYOUT.txt (選填，可上傳多個 PF 以自動解析 REFFLD 長度)",
+        "3. 上傳參照檔如 LAYOUT.txt (選填，支援無 'A' 前綴之 PF 規格檔)",
         type=["txt", "dds", "pf"], accept_multiple_files=True
     )
 
 if uploaded_file is not None:
-    # 先解析所有上傳的參照檔 (LAYOUT)
     ref_contents = [decode_bytes(f.getvalue(), selected_enc) for f in uploaded_refs] if uploaded_refs else []
     ref_dict = parse_ref_files(ref_contents)
     if ref_dict:
-        st.success(f"✅ 已從參照檔成功載入 {len(ref_dict)} 個外部欄位定義！")
+        st.success(f"✅ 已從 LAYOUT 參照檔成功載入 {len(ref_dict)} 個欄位定義！(例如：PAT01={ref_dict.get('PAT01', {}).get('length', '?')}, TTR02={ref_dict.get('TTR02', {}).get('length', '?')}, FUA01={ref_dict.get('FUA01', {}).get('length', '?')})")
+    elif uploaded_refs:
+        st.warning("⚠️ 已上傳參照檔，但未解析出任何欄位，請確認檔案內容。")
 
     string_data = decode_bytes(uploaded_file.getvalue(), selected_enc)
     records_dict = parse_dds_by_record(string_data, ref_dict, default_ref_len=default_ref_len)
@@ -324,7 +339,6 @@ if uploaded_file is not None:
             for rec in selected_records:
                 combined_elements.extend(records_dict[rec])
                 
-            # 先進行第一次座標計算，準備產生可編輯表格
             initial_resolved = calculate_positions(combined_elements, {})
             
             st.subheader("📋 變數欄位規格清單（💡 可直接在表格內點擊修改「顯示長度」，上方綠幕會即時重算！）")
@@ -339,9 +353,10 @@ if uploaded_file is not None:
                         "欄位名稱": el['name'],
                         "行號 (Row)": el['row'] if el['row'] > 0 else 0,
                         "列號 (Col)": el['col'] if el['col'] > 0 else 0,
+                        "資料長度": el['length'],
                         "顯示長度 (可點擊修改)": el['disp_len'],
                         "長度來源": el['ref_source'],
-                        "型態": el.get('data_type', '') or ('REF' if el.get('ref') else ''),
+                        "型態(小數)": el.get('data_type', ''),
                         "屬性": usage_desc,
                         "關鍵字 / REFFLD": el.get('keywords', '')
                     })
@@ -351,11 +366,10 @@ if uploaded_file is not None:
                 df = pd.DataFrame(field_rows)
                 edited_df = st.data_editor(
                     df,
-                    disabled=["欄位名稱", "行號 (Row)", "列號 (Col)", "長度來源", "型態", "屬性", "關鍵字 / REFFLD"],
+                    disabled=["欄位名稱", "行號 (Row)", "列號 (Col)", "資料長度", "長度來源", "型態(小數)", "屬性", "關鍵字 / REFFLD"],
                     use_container_width=True,
                     key=f"editor_{'_'.join(selected_records)}"
                 )
-                # 讀取使用者修改後的長度
                 for row_i, el_idx in enumerate(field_Element_Indices):
                     new_val = int(edited_df.loc[row_i, "顯示長度 (可點擊修改)"])
                     if new_val != initial_resolved[el_idx]['disp_len']:
@@ -363,7 +377,6 @@ if uploaded_file is not None:
             else:
                 st.info("此畫面沒有任何變數欄位。")
 
-            # 若使用者有在表格內修改長度，重新計算所有 +n 欄位座標並渲染綠幕
             final_resolved = calculate_positions(combined_elements, custom_lengths) if custom_lengths else initial_resolved
             screen_text = render_screen(final_resolved)
             safe_screen_text = html.escape(screen_text)
@@ -371,7 +384,6 @@ if uploaded_file is not None:
             st.subheader(f"🖥️ 畫面預覽：{' + '.join(selected_records)}")
             html_block = f"""
             <div style="background-color: #000000; padding: 20px; border-radius: 10px; border: 2px solid #333; overflow-x: auto; display: inline-block; min-width: 95%;">
-                <pre style="color: #00FF00; font-family: 'MS Gothic', 'MingLiU', 'DFKai-SB', 'Consolas', 'Courier New', monospace; font-size: 16px; font-weight: bold; line-height: 1.25; margin: 0; letter-spacing: 0px;">{safe_screen_text}</pre>
-            </div>
+                <pre style="color: #00FF00; font-family: 'MS Gothic', 'MingLiU', 'DFKai-SB', 'Consolas', 'Courier New', monospace; font-size: 16px; font-weight: bold; line-height: 1.25; margin: 0; letter-spacing: 0px;">{safe_screen_text}</pre></div>
             """
-            components.html(html_block, height=520, scrolling=True)
+            components.html(html_block, height=520,
